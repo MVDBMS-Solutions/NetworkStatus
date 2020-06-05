@@ -1,0 +1,199 @@
+       *
+       *
+       * Generate ping and tracert data into a new network.stats file
+       * to determine network bottlenecks.
+       * Tony Gravagno : 2020/06/04
+       * https://github.com/MVDBMS-Solutions/NetworkStatus
+       * MIT LIcense
+       
+       * Code parses ping data for reporting [ and graphing with phiCharts ]
+       * No parsing is done of the tracert data yet.
+       
+       !*************************************************
+       
+       * Usage:
+       
+       * Change DBMS if required and ensure that code executes properly for all platforms:
+       
+       dbms = "d3"; * jb, qm, uv, ud ...
+       
+       *   Check the target, osfolder, and osfile variables for your purposes.
+       
+       target = "kosday.com"
+       osfolder = "c:/temp"; * forward slash for D3 OSFI
+       osfile = "tracert.txt"
+       
+       * This code can be run on a Linux system but the commands might need to
+       * be modified to limit the number of loops in requests.
+       
+       * If you prefer to use a different filename for stats, check code for issues
+       stat.file = "network.stats"
+       
+       
+       * Verify that the 'tracert' command is available on the system. It may not be.
+       * If not, install an equivalent utility, modify the tracert.os.command below,
+       * and check the code to ensure it's parsing on valid text.
+       tracert.os.command = "tracert ":target:" > ":osfolder:"/":osfile
+       gosub init.environment
+       
+       *   Sleep delay of 3 seconds between operations gets frequent samples without flood.
+       sleep.delay = 3
+       
+       *   Compile/catalog in any account.
+       
+       *   Use D3 ZS command to run as a phantom:    ZS NET.STATUS
+       *   [ Has not been modified/tested with other MV platforms yet ]
+       
+       *   Add the word "clear" to the command-line to pre-clear stat file
+       if index(sentence(),"clear",1)>0 then clearfile fstats; * ZS NET.STATUS clear
+       
+       
+       *   Once the phantom starts for this program, it creates the log file if required,
+       *     and creates a couple helpful dict items.
+       
+       *   This program runs annother ZS to do a tracert in the background.
+       *      This is because it can take a long time to run, so it runs async.
+       *   It continues to do a ping, wait 10 seconds, repeat.
+       
+       
+       * To stop the phantoms, run this program again with the word stop: "net.status stop".
+       *	This does not need to be run from a phantom, just from TCL on any port.
+       if index(sentence(),"stop",1)>0 then
+          write "stop" on fdstats,"stop"
+       end else
+          delete fdstats,"stop"
+       end
+       
+       
+       
+       
+       *   When a result comes back from the tracert it's logged and restarted.
+       *   This results in about 1 tracert result for each 5 ping tests.
+       
+       *   There are two result types in the network.stats file:
+       *       Atb9 will be either 'ping' or 'tracert'.
+       *       For ping, atb1-4 are relevant, see code.
+       *       For tracert, no data is parsed.
+       *       For both, atb10+ = the raw output of the command
+       
+       * sample commands to view results:
+       * 1)   sort network.stats with any "[timed out]" date time (i
+       * 2)   sort network.stats with type tracert date time a21 a22 (i
+       * 3)   sort network.stats with type ping and with avg > 188
+       *                      or with type ping and with loss not 0
+       *                         date time loss min max avg by date by time (i
+       !*************************************************
+       
+       open osfolder to ftemp else stop 201,osfolder
+       delete ftemp,osfile
+       
+       * Modify for other platforms: 1) to start phantom, 2) to execute OS command
+       begin case
+          case dbms = "d3"
+             dbms.phantom = "zs"
+             dbms.exec = "!"
+             tracert.mv.cmd = dbms.phantom:" ":dbms.exec: tracert.os.command; * zs !foo
+          case 1
+       * dbms.phantom = "phantom"
+       * dbms.exec = "sh -c "
+             crt "unrecognized dbms '":dbms:"'"
+             stop
+       end case
+       
+       execute tracert.mv.cmd capturing out
+       
+       loop
+          read done from fdstats,"stop" else done = ""
+          if system(14)>0 then done = "stop"
+       until done = "stop" do
+          gosub get.ping
+          gosub get.tracert
+          sleep sleep.delay
+       repeat
+       stop
+       
+init.environment: 
+       
+       * Modify for other platforms: 1) to start phantom, 2) to execute OS command
+       begin case
+          case dbms = "d3"
+             execute "create-file ":stat.file:" 1 1001" capturing out
+          case 1
+       * execute "create.file ":stat.file capturing out
+             crt "unrecognized dbms '":dbms:"'"
+             stop
+       end case
+       open stat.file to fstats else stop 201,stat.file
+       open "dict ":stat.file to fdstats else stop 201,"dict ":stat.file
+       write change("a,0,,,,,d0/,g0.1,r,5", "," , @am) on fdstats,"date"
+       write change("a,0,,,,,mts,g1.1,r,8", "," , @am) on fdstats,"time"
+       write change("a,1,,,,,,,r,5", "," , @am) on fdstats,"loss"
+       write change("a,2,,,,,,,r,5", "," , @am) on fdstats,"min"
+       write change("a,3,,,,,,,r,5", "," , @am) on fdstats,"max"
+       write change("a,4,,,,,,,r,5", "," , @am) on fdstats,"avg"
+       write change("a,9,,,,,,,l,8", "," , @am) on fdstats,"type"
+       return
+       
+get.ping: 
+       execute dbms.exec: "ping ":target capturing ping
+       stats = ""
+       loss = ""
+       min = ""
+       max = ""
+       avg = ""
+       for line.num = 1 to dcount(ping,@am)
+          line = trim(ping<line.num>)
+          if field(line,' ',1) = "Packets:" then gosub parse.loss
+          if field(line,' ',1) = "Minimum" then gosub parse.stats
+       next line.num
+       stats<9> = "ping"
+       stats<10> = ping
+       date.now = date()
+       time.now = time()
+       write stats on fstats, date.now:".":time.now
+       gosub show.stats
+       return
+       
+get.tracert: 
+       read tracert from ftemp,osfile then
+          if index(tracert,"Trace complete",1)>0 then
+             sleep 1
+             crt "*":
+             if (index(tracert,"timed out",1)>0) then crt " timeout" else crt
+             stats = ""
+             stats<9> = "tracert"
+             stats<10> = tracert
+             date.now = date()
+             time.now = time()
+             write stats on fstats, date.now:".":time.now
+             delete ftemp,osfile
+             execute tracert.mv.cmd capturing out
+          end
+       end
+       return
+       
+parse.loss: 
+       loss = field(field(line,"(",2),"%",1)
+       stats<1> = loss
+       return
+       
+parse.stats: 
+       min = iconv(field(trim(field(line,",",1))," ",3),"mcn")
+       max = iconv(field(trim(field(line,",",2))," ",3),"mcn")
+       avg = iconv(field(trim(field(line,",",3))," ",3),"mcn")
+       stats<2> = min
+       stats<3> = max
+       stats<4> = avg
+       return
+       
+show.stats: 
+       crt date.now'd2/':" ":
+       crt oconv(time.now,'mts'):" ":
+       crt loss'r#6':" ":
+       crt min'r#6':" ":
+       crt max'r#6':" ":
+       crt avg'r#6':
+       if (index(ping,"timed out",1)>0) then crt " timeout" else crt
+       return
+       
+       end
